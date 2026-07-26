@@ -236,24 +236,19 @@ If the system was deployed into a **dedicated** resource group, you may delete t
 
 ## Step 5b: Untie Azure Monitor / Insights (and Backup, if enabled)
 
-If **Azure Local Insights** (or Azure Monitor) was enabled on the system, the deployment installed the **Azure Monitor Agent (AMA)** extension on each machine and configured **data collection rules (DCRs)**, **data collection endpoints (DCEs)**, and a **Log Analytics workspace** ([Monitor a single Azure Local system](https://learn.microsoft.com/azure/azure-local/manage/monitor-single-23h2)). Deleting the machine and Azure Local resources removes the AMA extension, but the DCRs, DCEs, their associations, alert rules, and the Log Analytics workspace **survive** as separate resources — often in a **different resource group** — and continue to ingest data and incur cost.
+If **Azure Local Insights** (or Azure Monitor) was enabled on the system, the deployment installed the **Azure Monitor Agent (AMA)** extension on each machine and configured **data collection rules (DCRs)**, **data collection endpoints (DCEs)**, and a **Log Analytics workspace** ([Monitor a single Azure Local system](https://learn.microsoft.com/azure/azure-local/manage/monitor-single-23h2)). Deleting the machine and Azure Local resources removes the AMA extension **and** its data collection rule associations (an association is a child of the machine and is removed with it — disabling Insights deletes the association, though the data already collected is not deleted). What **survives** as separate resources — often in a **different resource group** — are the **DCRs**, **DCEs**, **alert rules**, the **Log Analytics workspace**, and the **data already ingested** into it, all continuing to incur cost.
 
-Remove the associations first (each references both a rule and a machine), then the rules, then the endpoints:
+Remove the data collection rules and endpoints (in the monitoring resource group), then any alert rules and action groups the system created:
 
 ```azurecli
-# List, then delete, the DCR associations attached to each Arc machine
-az monitor data-collection rule association list --resource "<arc-machine-resource-id>" -o table
-az monitor data-collection rule association delete --name <association-name> --resource "<arc-machine-resource-id>"
-
-# Then the data collection rules and endpoints (in the monitoring resource group)
 az monitor data-collection rule delete --name <dcr-name> --resource-group <monitoring-rg>
 az monitor data-collection endpoint delete --name <dce-name> --resource-group <monitoring-rg>
 ```
 
-Then remove any alert rules and action groups the system created, and decide on the **Log Analytics workspace** — do **not** delete it if it is shared with other systems.
+Decide on the **Log Analytics workspace** — do **not** delete it if it is shared with other systems; deleting it also discards the data already collected.
 
-> [!NOTE]
-> If **Azure Backup** was enabled for the Azure Local VMs, deleting the VMs does **not** untie backup. A Recovery Services vault **cannot be deleted while any backup item exists, including soft-deleted items** (soft delete is on by default with a ~14-day retention), so a deleted-but-still-protected VM leaves an orphaned recovery point that keeps the vault — and its charges — alive. Stop protection and delete the backup data first (`az backup protection disable ... --delete-backup-data true`), remove any MARS / on-premises items, and purge soft-deleted items before deleting the vault. See [Delete a Recovery Services vault](https://learn.microsoft.com/azure/backup/backup-azure-delete-vault).
+> [!WARNING]
+> If **Azure Backup** was enabled for the Azure Local VMs, deleting the VMs does **not** untie backup — and cleaning it up **permanently destroys the backup data**. A Recovery Services vault **cannot be deleted while any backup item exists, including soft-deleted items** (soft delete is on by default with a ~14-day retention), so a deleted-but-still-protected VM leaves an orphaned recovery point that keeps the vault — and its charges — alive. To remove it, stop protection and delete the backup data (`az backup protection disable ... --delete-backup-data true`), remove any MARS / on-premises items, and purge soft-deleted items before deleting the vault. **`--delete-backup-data true` is irreversible and deletes every recovery point for the item**; because the VMs were already deleted in Step 3, that backup may be the last copy of the workload data, so confirm you need nothing from it first. See [Delete a Recovery Services vault](https://learn.microsoft.com/azure/backup/backup-azure-delete-vault).
 
 ## Step 5c: Remove Orphaned Role Assignments and Identities
 
@@ -261,14 +256,20 @@ A deployment grants role assignments to the **deployment service principal / use
 
 After the resource deletions, review and remove these orphaned assignments at **subscription** scope and on any **surviving or shared** resources (a shared key vault, storage account, Log Analytics workspace, or backup vault):
 
+> [!IMPORTANT]
+> The empty-`principalName` signal depends on being able to **read the Microsoft Entra directory** (Microsoft Graph), which is separate from your Azure RBAC role. In a locked-down or guest tenant, when running as a service principal, or without directory-read, **every** assignment shows an empty `principalName` — that means you cannot resolve names, not that everything is orphaned. Never bulk-delete on the empty-name filter alone: confirm each specific principal truly no longer exists first, or you will remove valid assignments, including the first-party ones you must keep.
+
 ```azurecli
-# List role assignments whose principal no longer resolves (empty principalName).
-# A very recently created principal can also show empty transiently, so confirm the
-# principalId truly no longer resolves in Entra ID before deleting.
+# Candidate orphans: assignments whose principal did not resolve to a name.
+# This requires Entra directory-read. If EVERY row is empty, you lack directory-read — not orphans.
 az role assignment list --all --include-inherited \
   --query "[?principalName==''].{principalId:principalId, role:roleDefinitionName, scope:scope}" -o table
 
-# After review, remove each confirmed-orphaned assignment
+# Confirm the specific principal is really gone before deleting (expect a 'not found' error):
+az ad sp show --id <principalId>     # a service principal or managed identity
+az ad user show --id <principalId>   # a user
+
+# Only after confirming it no longer exists, remove that assignment:
 az role assignment delete --ids <role-assignment-id>
 ```
 
