@@ -69,8 +69,10 @@ This guide extends the official [Decommission Azure Local](https://learn.microso
 
 ## Prerequisites
 
-- **Owner** or **Contributor** on every subscription / resource group that holds deployment resources
-- The list of **all** resource groups involved — workload resources (VMs, disks, NICs) may live in different resource groups than the platform resources
+- **Owner**, or **Contributor + User Access Administrator**, on every subscription / resource group that holds deployment resources. **Contributor alone is not enough** to remove resource locks (Step 2) or delete role assignments (Step 5c) — those need `Microsoft.Authorization` rights (Owner or User Access Administrator).
+- The list of **all** resource groups involved — workload resources (VMs, disks, NICs) may live in different resource groups than the platform resources; if **Insights** or **Azure Backup** was enabled, include the **monitoring / backup resource group** (often separate — Step 5b)
+- **Microsoft Entra Directory Readers** (Graph directory-read) to resolve principal names in Step 5c, plus **Application / User Administrator** if you also delete a throwaway deployment service principal or user
+- The **ActiveDirectory PowerShell module (RSAT)** on a domain-joined admin host, with delete rights over the deployment OU, for the on-premises AD cleanup (Step 5d)
 - Azure portal access; optionally Azure CLI with the `stack-hci-vm`, `customlocation`, and `arcappliance` extensions if you prefer CLI
 - Console or out-of-band access to the physical machines for the reimage step
 
@@ -112,7 +114,7 @@ Plus any workload resources created after deployment: Azure Local VMs, AKS Arc c
 > Counts reflect a typical deployment — confirm against your portal. A cloud witness storage account is required for a 2-node system and optional otherwise (a file-share witness means no cloud witness account). In a **failed** deployment, some resources may never have been created; skip any that don't exist — the order still holds for those that do.
 
 > [!IMPORTANT]
-> A deployment also creates objects that live **outside** the resource group and are **not** removed by deleting the resource group: **Entra ID role assignments and identities** (the deployment service principal / user, plus system-assigned managed identities), **Azure Monitor / Insights configuration** (the Azure Monitor Agent, data collection rules, and a Log Analytics workspace), and, for an AD-joined deployment, **on-premises Active Directory objects** (a dedicated OU with the cluster name object, node computer accounts, and deployment accounts). These are cleaned up in Steps 5b–5d and are easy to leave behind. Especially on **test subscriptions**, a deleted deployment principal leaves its role assignments dangling as **"Identity not found (Unknown)"** — the Azure equivalent of an unresolved SID on an AD ACL.
+> A deployment also creates objects that live **outside** the resource group and are **not** removed by deleting the resource group: **Entra ID role assignments and identities** (the deployment service principal / user, plus system-assigned managed identities), **Azure Monitor / Insights configuration** (the Azure Monitor Agent, data collection rules, and a Log Analytics workspace), and **on-premises Active Directory objects** (Azure Local requires AD DS, so every deployment has these: a dedicated OU with the cluster name object, node computer accounts, and deployment accounts). These are cleaned up in Steps 5b–5d and are easy to leave behind. Especially on **test subscriptions**, a deleted deployment principal leaves its role assignments dangling as **"Identity not found (Unknown)"** — the Azure equivalent of an unresolved SID on an AD ACL.
 
 Open the resource group(s) in the [Azure portal](https://portal.azure.com/) and review the resource list and the **Settings > Deployments** blade to confirm the full set before deleting anything.
 
@@ -126,7 +128,7 @@ By default, deployment applies **DoNotDelete** locks to the resources it creates
 ## Step 3: Delete Workload Resources First
 
 > [!WARNING]
-> **Back up workload data before you start.** The deletions in this step are irreversible and destroy all workload data on the system — VM guest data, AKS Arc workloads, and their data disks. Export or back up anything you need to keep, and capture any VM, disk, and network configuration you intend to recreate, before deleting anything.
+> **Back up workload data before you start.** The deletions in this step are irreversible and destroy all workload data on the system — VM guest data, AKS Arc workloads, and their data disks. Export or back up anything you need to keep, and capture any VM, disk, and network configuration you intend to recreate, before deleting anything. If your only backup is **Azure Backup**, back up to a target **outside** that Recovery Services vault — Step 5b tears the vault down (`--delete-backup-data true`), destroying those recovery points.
 
 Delete every resource that depends on the custom location / Arc resource bridge **before** touching those platform resources. Work top-down: delete the top-level workloads (VMs, then AKS clusters) first, then the resources they used (network interfaces, data disks), then the containers those lived in (storage paths, logical networks). Deleting a container before the resources inside it orphans them:
 
@@ -236,9 +238,9 @@ If the system was deployed into a **dedicated** resource group, you may delete t
 
 ## Step 5b: Untie Azure Monitor / Insights (and Backup, if enabled)
 
-If **Azure Local Insights** (or Azure Monitor) was enabled on the system, the deployment installed the **Azure Monitor Agent (AMA)** extension on each machine and configured **data collection rules (DCRs)**, **data collection endpoints (DCEs)**, and a **Log Analytics workspace** ([Monitor a single Azure Local system](https://learn.microsoft.com/azure/azure-local/manage/monitor-single-23h2)). Deleting the machine and Azure Local resources removes the AMA extension **and** its data collection rule associations (an association is a child of the machine and is removed with it — disabling Insights deletes the association, though the data already collected is not deleted). What **survives** as separate resources — often in a **different resource group** — are the **DCRs**, **DCEs**, **alert rules**, the **Log Analytics workspace**, and the **data already ingested** into it, all continuing to incur cost.
+If **Azure Local Insights** (or Azure Monitor) was enabled on the system, the deployment installed the **Azure Monitor Agent (AMA)** extension on each machine and configured **data collection rules (DCRs)**, **data collection endpoints (DCEs)**, and a **Log Analytics workspace** ([Monitor a single Azure Local system](https://learn.microsoft.com/azure/azure-local/manage/monitor-single-23h2)). Deleting the machine and Azure Local resources removes the AMA extension and, by Azure's parent-child cascade, its data collection rule associations (the association is an extension resource on the machine, so it goes when the machine does; disabling Insights likewise removes the association — though the data already collected is not deleted). What **survives** as separate resources — often in a **different resource group** — are the **DCRs**, **DCEs**, **alert rules**, the **Log Analytics workspace**, and the **data already ingested** into it, all continuing to incur cost.
 
-Remove the data collection rules and endpoints (in the monitoring resource group), then any alert rules and action groups the system created:
+Remove the data collection rules and endpoints (list them first with `az monitor data-collection rule list -g <monitoring-rg>` and `az monitor data-collection endpoint list -g <monitoring-rg>`), then any alert rules and action groups the system created:
 
 ```azurecli
 az monitor data-collection rule delete --name <dcr-name> --resource-group <monitoring-rg>
@@ -248,13 +250,13 @@ az monitor data-collection endpoint delete --name <dce-name> --resource-group <m
 Decide on the **Log Analytics workspace** — do **not** delete it if it is shared with other systems; deleting it also discards the data already collected.
 
 > [!WARNING]
-> If **Azure Backup** was enabled for the Azure Local VMs, deleting the VMs does **not** untie backup — and cleaning it up **permanently destroys the backup data**. A Recovery Services vault **cannot be deleted while any backup item exists, including soft-deleted items** (soft delete is on by default with a ~14-day retention), so a deleted-but-still-protected VM leaves an orphaned recovery point that keeps the vault — and its charges — alive. To remove it, stop protection and delete the backup data (`az backup protection disable ... --delete-backup-data true`), remove any MARS / on-premises items, and purge soft-deleted items before deleting the vault. **`--delete-backup-data true` is irreversible and deletes every recovery point for the item**; because the VMs were already deleted in Step 3, that backup may be the last copy of the workload data, so confirm you need nothing from it first. See [Delete a Recovery Services vault](https://learn.microsoft.com/azure/backup/backup-azure-delete-vault).
+> If **Azure Backup** was enabled for the Azure Local VMs, deleting the VMs does **not** untie backup — and cleaning it up **permanently destroys the backup data**. A Recovery Services vault **cannot be deleted while any backup item exists, including soft-deleted items** (soft delete is on by default with a ~14-day retention), so a deleted-but-still-protected VM leaves an orphaned recovery point that keeps the vault — and its charges — alive. To remove it, stop protection and delete the backup data (`az backup protection disable ... --delete-backup-data true` — illustrative; see the linked doc for the full parameter set), remove any MARS / on-premises items, and purge soft-deleted items before deleting the vault. **`--delete-backup-data true` is irreversible and deletes every recovery point for the item**; because the VMs were already deleted in Step 3, that backup may be the last copy of the workload data, so confirm you need nothing from it first. See [Delete a Recovery Services vault](https://learn.microsoft.com/azure/backup/backup-azure-delete-vault).
 
 ## Step 5c: Remove Orphaned Role Assignments and Identities
 
-A deployment grants role assignments to the **deployment service principal / user** (at **subscription** scope, including Contributor and User Access Administrator, and at resource-group scope) and creates **system-assigned managed identities** that hold grants on the key vault, storage, and workspace ([Assign deployment permissions](https://learn.microsoft.com/azure/azure-local/deploy/deployment-arc-register-server-permissions), [Use a local identity with Key Vault](https://learn.microsoft.com/azure/azure-local/deploy/deployment-local-identity-with-key-vault)). When the underlying principal is later deleted — common on **test subscriptions**, where a throwaway deployment principal is removed between redeployments — Azure does **not** remove its role assignments automatically. They appear as **"Identity not found"** with an **Unknown** type, the Azure equivalent of an unresolved SID on an AD ACL ([Troubleshoot Azure RBAC](https://learn.microsoft.com/azure/role-based-access-control/troubleshooting)).
+Two kinds of RBAC entries exist after a deployment, and only some are yours to remove. The identity that **runs** the deployment must already hold **Owner** (or **Contributor + User Access Administrator**), plus the deployment roles (Azure Stack HCI Administrator, Key Vault Contributor / Secrets Officer / Data Access Administrator, Storage Account Contributor), on the **resource group** — these are an operator **prerequisite**, not something the deployment creates, and they are **not** orphans to sweep ([Assign deployment permissions](https://learn.microsoft.com/azure/azure-local/deploy/deployment-arc-register-server-permissions)). Separately, the deployment **creates** resource-group-scoped assignments for the Azure Local resource provider and the machines' **system-assigned managed identities** (for example Azure Connected Machine Resource Manager and Key Vault Secrets / Certificates Officer), and holds a local deployment-secret identity in a key vault ([Use a local identity with Key Vault](https://learn.microsoft.com/azure/azure-local/deploy/deployment-local-identity-with-key-vault)). On **test subscriptions**, a throwaway deployment service principal or user often holds grants too. When that underlying principal is later deleted — common between redeployments — Azure does **not** remove its role assignments automatically. They appear as **"Identity not found"** with an **Unknown** type, the Azure equivalent of an unresolved SID on an AD ACL ([Troubleshoot Azure RBAC](https://learn.microsoft.com/azure/role-based-access-control/troubleshooting)).
 
-After the resource deletions, review and remove these orphaned assignments at **subscription** scope and on any **surviving or shared** resources (a shared key vault, storage account, Log Analytics workspace, or backup vault):
+After the resource deletions, review and remove these orphaned assignments where they sit — at **resource-group** scope, on any **surviving or shared** resources (a shared key vault, storage account, Log Analytics workspace, or backup vault if still present), and at **subscription** scope if a deployment principal was granted there:
 
 > [!IMPORTANT]
 > The empty-`principalName` signal depends on being able to **read the Microsoft Entra directory** (Microsoft Graph), which is separate from your Azure RBAC role. In a locked-down or guest tenant, when running as a service principal, or without directory-read, **every** assignment shows an empty `principalName` — that means you cannot resolve names, not that everything is orphaned. Never bulk-delete on the empty-name filter alone: confirm each specific principal truly no longer exists first, or you will remove valid assignments, including the first-party ones you must keep.
@@ -263,7 +265,7 @@ After the resource deletions, review and remove these orphaned assignments at **
 # Candidate orphans: assignments whose principal did not resolve to a name.
 # This requires Entra directory-read. If EVERY row is empty, you lack directory-read — not orphans.
 az role assignment list --all --include-inherited \
-  --query "[?principalName==''].{principalId:principalId, role:roleDefinitionName, scope:scope}" -o table
+  --query "[?principalName==''].{id:id, principalId:principalId, role:roleDefinitionName, scope:scope}" -o table
 
 # Confirm the specific principal is really gone before deleting (expect a 'not found' error):
 az ad sp show --id <principalId>     # a service principal or managed identity
@@ -280,19 +282,36 @@ Also remove the throwaway **deployment service principal / user** itself if it i
 
 ## Step 5d: Clean Up On-Premises Active Directory
 
-For an **AD-joined** deployment, the Active Directory preparation step created a **dedicated organizational unit (OU)** for the system, containing the **cluster name object (CNO)**, the **node computer accounts**, the **Cluster-Aware Updating (CAU) virtual computer object**, and the **deployment / lifecycle-manager (LCM) user accounts** ([Prepare Active Directory](https://learn.microsoft.com/azure/azure-local/deploy/deployment-prep-active-directory)). An Azure resource cleanup does not touch these; leaving them behind blocks a clean redeploy that reuses the same names.
+Azure Local 23H2 and later **requires** Active Directory Domain Services, so **every** deployment has on-premises AD objects to remove. The Active Directory preparation step created a **dedicated organizational unit (OU)** for the system, containing the **cluster name object (CNO)**, the **node computer accounts**, the **Cluster-Aware Updating (CAU) virtual computer object**, and the **deployment / lifecycle-manager (LCM) user accounts** ([Prepare Active Directory](https://learn.microsoft.com/azure/azure-local/deploy/deployment-prep-active-directory)). An Azure resource cleanup does not touch these; leaving them behind blocks a clean redeploy that reuses the same names.
 
 > [!WARNING]
 > **Export the BitLocker recovery keys before deleting the OU.** BitLocker recovery information is stored as child objects **under the computer accounts inside the OU**; a recursive OU delete destroys them. Per [Prepare Active Directory](https://learn.microsoft.com/azure/azure-local/deploy/deployment-prep-active-directory): *"If the machine volumes are encrypted, deleting the OU removes the BitLocker recovery keys."* Back up the recovery keys (and anything else you need) first.
 
-Remove the objects, then the OU — clearing the accidental-deletion protection first. These are standard Active Directory operations, not a Microsoft-published Azure Local teardown step, so review before running:
+Remove the objects, then the OU — clearing accidental-deletion protection across the whole subtree first. These are standard Active Directory operations, not a Microsoft-published Azure Local teardown step, so review before running:
 
 ```powershell
-# From a machine with the ActiveDirectory PowerShell module and rights to the OU.
-# Back up the BitLocker recovery keys under the OU BEFORE this point.
-$ou = "OU=<deployment-ou>,DC=<domain-dn>"
-Set-ADOrganizationalUnit -Identity $ou -ProtectedFromAccidentalDeletion $false
-Remove-ADOrganizationalUnit -Identity $ou -Recursive   # removes the CNO, node, CAU, and user objects it contains
+# From a machine with the ActiveDirectory PowerShell module and delete rights over the OU.
+$ou = "OU=<deployment-ou>,DC=contoso,DC=com"
+
+# 1. VERIFY scope first. The delete below is recursive and irreversible. Confirm $ou is
+#    the deployment OU itself and that this list contains only its objects, nothing broader.
+Get-ADObject -SearchBase $ou -Filter * -Properties ProtectedFromAccidentalDeletion |
+  Select-Object Name, ObjectClass, ProtectedFromAccidentalDeletion
+
+# 2. Back up the BitLocker recovery keys under the OU BEFORE going further; see the warning above.
+
+# 3. Clear accidental-deletion protection across the whole subtree (the OU and every child).
+#    Clearing it on the OU alone is not enough: a protected descendant (a nested OU is
+#    protected by default) places a Deny-Delete ACE, so Remove-ADOrganizationalUnit -Recursive
+#    fails with "Access denied" and leaves a half-deleted OU.
+Get-ADObject -SearchBase $ou -Filter * -Properties ProtectedFromAccidentalDeletion |
+  Where-Object { $_.ProtectedFromAccidentalDeletion } |
+  Set-ADObject -ProtectedFromAccidentalDeletion $false
+
+# 4. Preview, then delete. Run the -WhatIf line, confirm the scope, then uncomment the
+#    final line to execute. Removes the CNO, node, CAU, and user objects it contains.
+Remove-ADOrganizationalUnit -Identity $ou -Recursive -WhatIf
+# Remove-ADOrganizationalUnit -Identity $ou -Recursive
 ```
 
 ## Step 6: Reimage and Redeploy
