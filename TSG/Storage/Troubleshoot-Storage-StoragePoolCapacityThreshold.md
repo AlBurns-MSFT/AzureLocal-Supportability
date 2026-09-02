@@ -518,8 +518,8 @@ threshold *and* the volume genuinely shows large interior free space.
 #### Preconditions for reclamation (both paths)
 
 Both the automatic return above and the slab consolidation below depend on ReFS
-returning freed slabs, so these two conditions gate the whole of Path B, not just
-the no-downtime branch.
+returning freed slabs, so this check gates the whole of Path B, not just the
+no-downtime branch.
 
 Check TRIM/unmap on the CSV owner node. The command reports **one line per file
 system**, and Azure Local CSVs are ReFS (see [Terminology](#terminology)), so the
@@ -537,13 +537,6 @@ what a reclaiming cluster shows. `1` means it has been explicitly disabled, and
 deleted capacity will not be returned until that is reverted. `is not currently
 set` means no explicit override is present, so the platform default applies; treat
 that as inconclusive rather than as a fault, and move on to the other checks.
-
-> [!IMPORTANT]
-> **Stretched clusters never reclaim deleted capacity.** *"Because TRIM is disabled
-> for stretched clusters, storage isn't returned to the pool after data is
-> deleted"* ([thin provisioning][thin-prov]). On a stretched cluster this reclaim
-> procedure will not help; treat the shortage as a
-> [Path A](#path-a-fixed-provisioned-volumes) capacity problem instead.
 
 > [!CAUTION]
 > **Moving VM disks to another volume does not relieve pool pressure, and can
@@ -770,14 +763,13 @@ that as inconclusive rather than as a fault, and move on to the other checks.
 > A consolidation pass can legitimately return little or no capacity. The most
 > common reasons, in order: the volume's footprint already matches the data
 > actually written, so there is nothing to reclaim (see the note at the start of
-> this procedure); TRIM/unmap is disabled (`DisableDeleteNotify = 1`) or the
-> cluster is **stretched**, where deleted capacity is never returned at all; or
-> slabs are still pinned by data in use (confirm every VM on the volume is stopped
+> this procedure); ReFS delete notification has been explicitly disabled, so
+> freed slabs are never returned; or slabs are still pinned by data in use (confirm every VM on the volume is stopped
 > in Step 1 and that stale checkpoints were merged in the preparation step). Note
 > that some slabs report "pinned unmovable" even on a fully quiesced volume, so a
 > partial reclaim is not by itself a failure. If real interior free space exists,
-> ReFS delete notification is not explicitly disabled, the cluster is not
-> stretched, all workloads were offline, and
+> ReFS delete notification is not explicitly disabled, all workloads were
+> offline, and
 > checkpoints were merged, but the pool still does not drop after the unmap wait
 > (Step 3), open a Microsoft support case rather than repeating the procedure.
 
@@ -918,8 +910,7 @@ firm conditions is met. Do not simply re-run the procedure.
   *operational state* is `Incomplete` / read-only from a drive-quorum loss rather
   than capacity, that is a separate, higher-severity problem. Escalate immediately.)
 - **Path B completed with every precondition met** (confirmed real interior free
-  space, ReFS delete notification not explicitly disabled and the cluster not
-  stretched, every VM on the volume
+  space, ReFS delete notification not explicitly disabled, every VM on the volume
   stopped, checkpoints merged) and you waited out the
   ReFS unmap, but pool `AllocatedSize` still does not drop.
 - The reserve-capacity fault (`InsufficientReserveCapacity`) **persists after**
