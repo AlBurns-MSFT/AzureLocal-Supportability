@@ -554,27 +554,28 @@ fsutil behavior query DisableDeleteNotify
 > reduces what consolidation can recover. This is preparation, not part of the
 > maintenance window.
 
-1. **Stop active writes to the volume by taking its VMs offline.** ReFS allocates
-   on write, so a VM that keeps running keeps allocating and re-dirtying slabs
-   while consolidation is trying to empty them. Quiescing writes is what makes a
-   consolidation pass deterministic and complete; a pass run under live workload
-   can recover little or nothing and may have to be repeated. First find where
-   each VM is running:
+1. **Take the VMs on the affected volume offline.** Consolidation works by
+   relocating live data out of partially used slabs so whole slabs can be freed,
+   and it cannot relocate data belonging to files that are actively in use. Those
+   slabs are reported as "pinned unmovable" and skipped, which is the main reason
+   a pass run against a live volume recovers far less than one run against a
+   quiesced volume. Stopping the workload is what makes that data movable. First
+   find where each VM is running:
 
    ```powershell
    Get-ClusterGroup | Where-Object GroupType -eq 'VirtualMachine' |
        Select-Object Name, OwnerNode, State
    ```
 
-   **Prefer a clean guest shutdown**, which ends guest writes **without** writing
-   a saved-state file:
+   **Prefer a clean guest shutdown**, which releases the VM's files **without**
+   writing a saved-state file:
 
    ```powershell
    Stop-VM -Name "<vm name>"   # graceful guest shutdown; run on/target the owner node
    ```
 
    If a guest will not shut down cleanly (hung, or no integration services), a
-   forced turn-off also ends guest writes **without** writing a
+   forced turn-off also releases the VM's files **without** writing a
    saved-state file, but only as a last resort **[HIGH RISK]**:
 
    ```powershell
@@ -593,13 +594,12 @@ fsutil behavior query DisableDeleteNotify
    > the very volume you are trying to free, consuming the capacity you are trying
    > to recover.
    >
-   > `Suspend-VM` (pause) writes no state file and does halt the guest's I/O, but it
-   > leaves the virtual disk handles open and the guest's memory resident on the
-   > host, and it has **not been validated** as sufficient for a complete
-   > consolidation pass. Until it has been, use a clean shutdown, which is the
-   > configuration this procedure has been validated in. Putting the cluster
-   > resource into redirected access is **not** a substitute either, because the VMs
-   > keep running and keep writing.
+   > `Suspend-VM` (pause) writes no state file, but it leaves the virtual disk
+   > files open and the guest's memory resident on the host, so it is not a
+   > reliable substitute for a shutdown. Putting the cluster resource into
+   > redirected access is **not** a substitute either, because the VMs keep running
+   > and their files stay in use. To make a file's slabs movable, the workload
+   > holding it has to be stopped.
 
    > [!IMPORTANT]
    > For **Arc-managed VMs** (Azure Local 23H2+), stop the VM from Azure (portal
