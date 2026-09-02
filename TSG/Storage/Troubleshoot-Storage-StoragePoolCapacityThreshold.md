@@ -458,11 +458,12 @@ Set-StoragePool -FriendlyName "<pool name>" -ThinProvisioningAlertThresholds @(8
 > [!IMPORTANT]
 > **Ownership gate (read before starting).** Capacity work on a production volume
 > is owned by the customer's cluster or storage administrator. The read-only Quick
-> triage, the [Verify](#verify) queries, and the no-downtime pre-branch below are
-> always safe to run. The **numbered consolidation steps** are a scheduled
-> maintenance-window procedure that takes VMs offline: if you are not that
-> administrator, or you are unsure whether you are authorized to take these
-> workloads offline, stop before them and hand off.
+> triage and the [Verify](#verify) queries are always safe to run. Everything else
+> here changes state: the no-downtime branch below asks you to **delete orphaned
+> virtual disk files**, which is irreversible, and the **numbered consolidation
+> steps** are a scheduled maintenance-window procedure that takes VMs offline. If
+> you are not that administrator, or you are unsure whether you are authorized to
+> delete those files or take these workloads offline, stop here and hand off.
 
 On thin volumes, capacity that was written and later deleted can remain committed
 to the pool in partially used 256 MB "slabs". A slab is only returned to the pool
@@ -492,8 +493,21 @@ an offline window**. Identify which case you are in before scheduling anything.
 
 **If you deleted whole VMs or files, start here. This path needs no downtime:**
 
-1. Confirm the deletions are complete. For Arc VMs, confirm they were deleted
-   **through Azure** (see the caution below).
+1. **Confirm the virtual disk files themselves are gone, not just the VMs.** Deleting
+   a VM does not necessarily delete its disks: `Remove-VM` "deletes the virtual
+   machine's configuration file, but does not delete any virtual hard drives"
+   ([Remove-VM][remove-vm]). Orphaned `.vhdx` / `.avhdx` files left behind still
+   occupy their slabs, and no amount of waiting will reclaim them. Check the volume
+   for disks with no owning VM, and delete the ones you have confirmed are unneeded:
+
+   ```powershell
+   # Virtual disk files still present on the affected volume
+   Get-ChildItem "C:\ClusterStorage\<volume>" -Recurse -Include *.vhdx,*.avhdx,*.vhds |
+       Select-Object FullName, @{N='GB';E={[math]::Round($_.Length/1GB,1)}}
+   ```
+
+   For Arc VMs, delete them **through Azure** (see the disk-relocation caution
+   below, which applies to Arc-managed storage generally).
 2. Wait at least 15 minutes; longer on a busy cluster.
 3. Re-measure with the [Verify](#verify) queries.
 
@@ -501,15 +515,28 @@ If the pool has dropped below threshold, **you are done, with no maintenance
 window**. Continue to the consolidation procedure only if the pool is still above
 threshold *and* the volume genuinely shows large interior free space.
 
-#### Preconditions for automatic reclamation
+#### Preconditions for reclamation (both paths)
 
-Automatic reclamation depends on TRIM/unmap being active. Check this before
-concluding that reclamation "did not work":
+Both the automatic return above and the slab consolidation below depend on ReFS
+returning freed slabs, so these two conditions gate the whole of Path B, not just
+the no-downtime branch.
+
+Check TRIM/unmap on the CSV owner node. The command reports **one line per file
+system**, and Azure Local CSVs are ReFS (see [Terminology](#terminology)), so the
+**ReFS** line is the one that governs:
 
 ```powershell
-# 0 = enabled (expected). 1 means deleted data is never returned to the pool.
+# Run on the CSV owner node. Output is per file system, for example:
+#   NTFS DisableDeleteNotify = 0
+#   ReFS DisableDeleteNotify is not currently set
 fsutil behavior query DisableDeleteNotify
 ```
+
+Read the **ReFS** line only. `0` means delete notification is enabled, which is
+what a reclaiming cluster shows. `1` means it has been explicitly disabled, and
+deleted capacity will not be returned until that is reverted. `is not currently
+set` means no explicit override is present, so the platform default applies; treat
+that as inconclusive rather than as a fault, and move on to the other checks.
 
 > [!IMPORTANT]
 > **Stretched clusters never reclaim deleted capacity.** *"Because TRIM is disabled
@@ -643,8 +670,8 @@ fsutil behavior query DisableDeleteNotify
 
    > [!NOTE]
    > **Consolidation runs at low priority by default.** `Optimize-Volume`
-   > documents `-NormalPriority` as *"Indicates that this cmdlet the operation at
-   > normal priority. By default, the priority is low"*
+   > documents `-NormalPriority` as running the operation at normal priority, and
+   > states that *"By default, the priority is low"*
    > ([Optimize-Volume](https://learn.microsoft.com/powershell/module/storage/optimize-volume)),
    > matching `defrag /h` (*"Runs the operation at normal priority (default is
    > low)"*). The pass therefore yields to workload I/O rather than competing with
@@ -712,7 +739,8 @@ fsutil behavior query DisableDeleteNotify
 > in Step 1 and that stale checkpoints were merged in the preparation step). Note
 > that some slabs report "pinned unmovable" even on a fully quiesced volume, so a
 > partial reclaim is not by itself a failure. If real interior free space exists,
-> TRIM is enabled, the cluster is not stretched, all workloads were offline, and
+> ReFS delete notification is not explicitly disabled, the cluster is not
+> stretched, all workloads were offline, and
 > checkpoints were merged, but the pool still does not drop after the unmap wait
 > (Step 3), open a Microsoft support case rather than repeating the procedure.
 
@@ -725,7 +753,7 @@ fsutil behavior query DisableDeleteNotify
 | Fixed | Remove unneeded volumes | A3: shrink/remove (ReFS = evacuate + recreate) |
 | Fixed | Stop the alert (risk accepted) | A4: disable the Health Service alert |
 | Fixed | Move the alert threshold | A5: raise `ThinProvisioningAlertThresholds` |
-| Thin | Return capacity from **deleted whole files/VMs** | Path B pre-branch: delete, then wait (no downtime) |
+| Thin | Return capacity from **deleted whole files/VMs** | Path B pre-branch: confirm the disk files are gone, wait, re-measure (no downtime) |
 | Thin | Return capacity stranded by **interior fragmentation** | Path B: SlabConsolidate + ReFS unmap (offline window) |
 
 ## Verify
@@ -853,7 +881,8 @@ firm conditions is met. Do not simply re-run the procedure.
   *operational state* is `Incomplete` / read-only from a drive-quorum loss rather
   than capacity, that is a separate, higher-severity problem. Escalate immediately.)
 - **Path B completed with every precondition met** (confirmed real interior free
-  space, TRIM enabled and the cluster not stretched, every VM on the volume
+  space, ReFS delete notification not explicitly disabled and the cluster not
+  stretched, every VM on the volume
   stopped, checkpoints merged) and you waited out the
   ReFS unmap, but pool `AllocatedSize` still does not drop.
 - The reserve-capacity fault (`InsufficientReserveCapacity`) **persists after**
@@ -883,5 +912,6 @@ Include the data-collection output above with any Microsoft support case.
 
 [thin-prov]: https://learn.microsoft.com/azure/azure-local/manage/manage-thin-provisioning-23h2
 [unsupported-ops]: https://learn.microsoft.com/azure/azure-local/manage/virtual-machine-operations
+[remove-vm]: https://learn.microsoft.com/powershell/module/hyper-v/remove-vm
 
 ---
