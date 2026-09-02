@@ -546,15 +546,21 @@ that as inconclusive rather than as a fault, and move on to the other checks.
 > [Path A](#path-a-fixed-provisioned-volumes) capacity problem instead.
 
 > [!CAUTION]
-> **Do not move VM disks to another volume as a way to relieve pressure.** For
-> **Arc-managed Azure Local VMs (23H2+)**, moving a VHD/VHDX to another CSV with
-> host-side tools (`Move-VMStorage`, Failover Cluster Manager, or a manual file
-> move) is *storage live migration*, which Microsoft lists among operations that
-> *"can lead to Azure Local VMs becoming unmanageable from the Azure portal"*
-> ([unsupported VM operations][unsupported-ops]). Azure tracks each disk's location
-> through a **storage path** (`Microsoft.AzureStackHCI/storagecontainers`)
-> resource; a host-side move leaves that resource pointing at the old volume, and
-> the VM, disk, and network-interface resources can be left stale and undeletable.
+> **Moving VM disks to another volume does not relieve pool pressure, and can
+> break Arc management.** Every CSV on the cluster draws from the **same storage
+> pool** (Azure Local uses [one pool per cluster][s2d-overview]), so relocating a
+> VHDX from one CSV to another moves the data without returning a single byte to
+> the pool. It is motion with no benefit for this problem.
+>
+> For **Arc-managed Azure Local VMs (23H2+)** it is also actively harmful. Moving
+> a VHD/VHDX to another CSV with host-side tools (`Move-VMStorage`, Failover
+> Cluster Manager, or a manual file move) is *storage live migration*, which
+> Microsoft lists among operations that *"can lead to Azure Local VMs becoming
+> unmanageable from the Azure portal"* ([unsupported VM operations][unsupported-ops]).
+> Azure tracks each disk's location through a **storage path**
+> (`Microsoft.AzureStackHCI/storagecontainers`) resource; a host-side move leaves
+> that resource pointing at the old volume, and the VM, disk, and
+> network-interface resources can be left stale and undeletable.
 >
 > There is **no supported in-place move** of an existing Arc VM disk between
 > volumes: a storage path is selected at **creation** time. To place a workload on
@@ -563,7 +569,13 @@ that as inconclusive rather than as a fault, and move on to the other checks.
 >
 > This restriction applies to **Arc-managed** VMs. For traditional (non-Arc)
 > clustered Hyper-V VMs, `Move-VMStorage` with the cluster resource updated
-> accordingly remains supported.
+> accordingly remains supported, though the same one-pool point applies: it still
+> will not free pool capacity.
+>
+> Live-migrating a VM to a **different node** does not help either. The CSV is
+> cluster-shared, so the virtual disk file stays on the same volume and stays in
+> use, just from another node. Stopping the workload is the only action that makes
+> its slabs movable.
 
 > [!NOTE]
 > This procedure recovers capacity only when the volume genuinely holds far less
@@ -571,6 +583,31 @@ that as inconclusive rather than as a fault, and move on to the other checks.
 > (`Get-Volume` / volume reports show large free space while `FootprintOnPool` is
 > close to `Size × resiliency`). If footprint matches the data actually written,
 > there is nothing to reclaim.
+
+> [!TIP]
+> **Cheapest checks first. A consolidation pass is not a cheap probe.** The steps
+> above cost seconds and can make the maintenance window unnecessary: enumerate
+> the virtual disk files, confirm the provisioning type, rule out the stop
+> conditions, and if whole files were deleted just wait and re-measure.
+>
+> Running consolidation with the workload still up, to see what it recovers before
+> committing to a window, is a reasonable probe. It is non-destructive, it
+> relocates data rather than deleting any, it runs at low priority, and a
+> disappointing result costs time rather than data. Two things to weigh before
+> doing it:
+>
+> - On a multi-terabyte volume it is **hours** of back-end relocation I/O, and
+>   because every volume shares the one pool, that load is felt by workloads on
+>   other volumes. It is cheap in risk, not in cost.
+> - On a pool that is already **close to full**, be more careful. ReFS allocates
+>   on write, so relocating live data writes the new copy before releasing the
+>   old. Whether that transiently raises pool allocation on a nearly-full pool is
+>   not established here either way, and pool exhaustion is the one failure in
+>   this article that takes VMs offline. On a pool with comfortable headroom this
+>   is not a concern; near the limit, do the read-only checks above first.
+>
+> A probe that recovers little is not proof the procedure does not work. It is
+> the expected result when the workload is still holding its files.
 
 **Procedure for interior fragmentation (requires an offline window for VMs on the affected volume; the window lasts through slab consolidation, which can take hours on large volumes):** [MEDIUM RISK]
 
@@ -913,5 +950,6 @@ Include the data-collection output above with any Microsoft support case.
 [thin-prov]: https://learn.microsoft.com/azure/azure-local/manage/manage-thin-provisioning-23h2
 [unsupported-ops]: https://learn.microsoft.com/azure/azure-local/manage/virtual-machine-operations
 [remove-vm]: https://learn.microsoft.com/powershell/module/hyper-v/remove-vm
+[s2d-overview]: https://learn.microsoft.com/windows-server/storage/storage-spaces/storage-spaces-direct-overview
 
 ---
