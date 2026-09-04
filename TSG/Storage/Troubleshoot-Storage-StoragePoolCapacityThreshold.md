@@ -491,52 +491,68 @@ an offline window**. Identify which case you are in before scheduling anything.
   case that needs slab consolidation, and therefore the only case that needs the
   offline window.
 
-**If you deleted whole VMs or files, start here. This path needs no downtime:**
+**If you deleted whole VMs or files, start here. This path needs no downtime
+unless you find orphaned disks that have to be removed:**
 
-1. **Confirm the virtual disk files themselves are gone, not just the VMs.** Deleting
-   a VM does not necessarily delete its disks: `Remove-VM` "deletes the virtual
-   machine's configuration file, but does not delete any virtual hard drives"
-   ([Remove-VM][remove-vm]). Orphaned `.vhdx` / `.avhdx` files left behind still
-   occupy their slabs, and no amount of waiting will reclaim them. Check the volume
-   for disks with no owning VM, and delete the ones you have confirmed are unneeded:
+1. **Confirm the virtual disk files are actually gone, not just the VMs.**
+   `Remove-VM` "deletes the virtual machine's configuration file, but does not
+   delete any virtual hard drives" ([Remove-VM][remove-vm]), so disks left behind
+   still occupy their slabs and no amount of waiting will reclaim them.
+
+   Build the in-use set from **every node in the cluster**, not just the one you
+   are signed in to. A VM running on another node holds its disks open exactly the
+   same way, and a single-node listing will not show that:
 
    ```powershell
-   # Virtual disk files still present on the affected volume
+   # Disks in use anywhere on the cluster, including checkpoint disks
+   $inUse = Get-ClusterNode | ForEach-Object {
+       Get-VM -ComputerName $_.Name | ForEach-Object {
+           $_ | Get-VMHardDiskDrive | Select-Object -ExpandProperty Path
+           $_ | Get-VMSnapshot | Get-VMHardDiskDrive | Select-Object -ExpandProperty Path
+       }
+   } | Sort-Object -Unique
+
+   # Files on the volume that nothing on the cluster references
    Get-ChildItem "C:\ClusterStorage\<volume>" -Recurse -Include *.vhdx,*.avhdx,*.vhds |
-       Select-Object FullName, @{N='GB';E={[math]::Round($_.Length/1GB,1)}}
+       Where-Object { $_.FullName -notin $inUse } |
+       Select-Object FullName, @{N='GB';E={[math]::Round($_.Length/1GB,1)}}, LastWriteTime
    ```
 
-   For Arc VMs, delete them **through Azure** (see the disk-relocation caution
-   below, which applies to Arc-managed storage generally).
+   That output is a list of **candidates, not a list of garbage.** Before removing
+   anything, rule out all three of the following:
+
+   - **Arc-managed disks and images.** For Azure Local VMs enabled by Arc the disk
+     is an Azure resource, and one that exists but is not currently attached to a
+     VM is invisible to a host-side listing while still being live customer data.
+     Check Azure as well as the host: `az stack-hci-vm disk list`,
+     `az stack-hci-vm image list`, and `az stack-hci-vm storagepath list` for the
+     paths in use on this volume.
+   - **Templates, golden images, ISOs, and backup targets**, which legitimately
+     have no attached VM and are still needed.
+   - **Checkpoint disks.** Never delete an `.avhdx` directly. It is a differencing
+     disk, and removing it breaks the chain and can destroy the VM's data. Merge
+     checkpoints through Hyper-V instead (`Get-VM | Get-VMSnapshot`, then
+     `Remove-VMSnapshot`), which collapses the `.avhdx` into its parent and frees
+     the space properly.
+
+   Delete only what you have positively accounted for on all three counts.
+   **[HIGH RISK]**
+
+   > [!WARNING]
+   > **Deleting a virtual disk file is irreversible and destroys whatever it
+   > contains.** A file that looks unreferenced from one node may be attached on
+   > another node, attached in Azure, or the parent of a checkpoint chain. If you
+   > cannot positively account for a file, leave it in place and open a support
+   > case. Reclaiming capacity is never worth deleting a disk you could not
+   > identify.
+
+   For **Arc VMs**, delete the VM through Azure rather than with host tools.
 2. Wait at least 15 minutes; longer on a busy cluster.
 3. Re-measure with the [Verify](#verify) queries.
 
 If the pool has dropped below threshold, **you are done, with no maintenance
 window**. Continue to the consolidation procedure only if the pool is still above
 threshold *and* the volume genuinely shows large interior free space.
-
-#### Preconditions for reclamation (both paths)
-
-Both the automatic return above and the slab consolidation below depend on ReFS
-returning freed slabs, so this check gates the whole of Path B, not just the
-no-downtime branch.
-
-Check TRIM/unmap on the CSV owner node. The command reports **one line per file
-system**, and Azure Local CSVs are ReFS (see [Terminology](#terminology)), so the
-**ReFS** line is the one that governs:
-
-```powershell
-# Run on the CSV owner node. Output is per file system, for example:
-#   NTFS DisableDeleteNotify = 0
-#   ReFS DisableDeleteNotify is not currently set
-fsutil behavior query DisableDeleteNotify
-```
-
-Read the **ReFS** line only. `0` means delete notification is enabled, which is
-what a reclaiming cluster shows. `1` means it has been explicitly disabled, and
-deleted capacity will not be returned until that is reverted. `is not currently
-set` means no explicit override is present, so the platform default applies; treat
-that as inconclusive rather than as a fault, and move on to the other checks.
 
 > [!CAUTION]
 > **Moving VM disks to another volume does not relieve pool pressure, and can
